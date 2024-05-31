@@ -12,7 +12,6 @@ import random
 import rclpy
 import rclpy.logging
 import rclpy.qos
-import rclpy.qos_event
 import sys
 import time
 import types
@@ -20,7 +19,7 @@ import threading
 from .constants import *
 import builtin_interfaces.msg
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __name__ = "rospy2"
 
 numpy = None # may be imported later
@@ -52,15 +51,26 @@ def get_param(param_name, default_value = None):
         _node.declare_parameter(param_name, default_value)
     return _node.get_parameter(param_name)._value
 
-def init_node(node_name, anonymous=False, log_level=INFO, disable_signals=False):
+def has_param(param_name):
+    global _node
+    if param_name.startswith("/"):
+        logerror("Getting parameters of other nodes is not yet supported")
+        return False
+
+    param_name = param_name.strip("~")
+    if not _node.has_parameter(param_name):
+        return False
+    return True
+
+def init_node(name, anonymous=False, log_level=INFO, disable_signals=False):
     global _node, _logger, _clock, _thread_spin
     if anonymous:
-        node_name += "_" + str(random.randint(10000,99999))
+        name += "_" + str(random.randint(10000,99999))
 
     _node = rclpy.create_node(
-        node_name,
+        name,
         allow_undeclared_parameters = True,
-        automatically_declare_parameters_from_overrides = True,
+        automatically_declare_parameters_from_overrides = False,
     )
     _logger = _node.get_logger()
     _clock = _node.get_clock()
@@ -116,7 +126,7 @@ def set_param(parameter_name, parameter_value):
     elif type(parameter_value) is float:
         parameter_type = rclpy.Parameter.Type.DOUBLE
     elif type(parameter_value) is int:
-        parameter_type = rclpy.Parameter.Type.INT
+        parameter_type = rclpy.Parameter.Type.INTEGER
     elif type(parameter_value) is bool:
         parameter_type = rclpy.Parameter.Type.BOOL
     else:
@@ -159,6 +169,12 @@ def get_time():
         raise ROSInitException("time is not initialized. Have you called init_node()?")
     return _clock.now().nanoseconds/1e9
 
+def get_rostime():
+    float_secs = get_time()
+    secs = int(float_secs)
+    nsecs = int((float_secs - secs) * rclpy.duration.S_TO_NS)
+    return Time(secs, nsecs)
+
 def wait_for_message(topic_name, topic_type):
     global _node, _wait_for_message_release
     _wait_for_message_release = False
@@ -180,18 +196,27 @@ def wait_for_service(service_name):
                 break
         time.sleep(0.5)
 
+def get_namespace():
+    global _node
+    return _node.get_namespace()
+
 class Publisher(object):
-    def __init__(self, topic_name, topic_type, queue_size = 1):
+    def __init__(self, topic_name, topic_type, queue_size=0, latch=False):
         global _node
         self.reg_type = "pub"
         self.data_class = topic_type
         self.name = topic_name
         self.resolved_name = topic_name
         self.type = _ros2_type_to_type_name(topic_type)
+        qos = rclpy.qos.qos_profile_system_default
+        if queue_size > 0: qos.history = rclpy.qos.HistoryPolicy.KEEP_LAST
+        qos.depth = queue_size
+        if latch: qos.durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL
+
         self._pub = _node.create_publisher(
             topic_type,
             topic_name,
-            rclpy.qos.QoSProfile(depth = queue_size, history = rclpy.qos.HistoryPolicy.KEEP_LAST)
+            qos,
         )
         self.get_num_connections = self._pub.get_subscription_count
 
@@ -213,7 +238,7 @@ class Publisher(object):
         _node.destroy_publisher(self._pub)
 
 class Subscriber(object):
-    def __init__(self, topic_name, topic_type, callback, callback_args = None):
+    def __init__(self, topic_name, topic_type, callback, queue_size = 0, callback_args = None):
         global _node
         self.reg_type = "sub"
         self.data_class = topic_type
@@ -222,7 +247,10 @@ class Subscriber(object):
         self.type = _ros2_type_to_type_name(topic_type)
         self.callback = callback
         self.callback_args = callback_args
-        self._sub = _node.create_subscription(topic_type, topic_name, self._ros2_callback, 10, event_callbacks = rclpy.qos_event.SubscriptionEventCallbacks())
+        qos = rclpy.qos.qos_profile_sensor_data
+        if queue_size > 0: qos.history = rclpy.qos.HistoryPolicy.KEEP_LAST
+        qos.depth = queue_size
+        self._sub = _node.create_subscription(topic_type, topic_name, self._ros2_callback, qos_profile=qos)
         _node.guards
         self.get_num_connections = lambda: 1 # No good ROS2 equivalent
 
@@ -271,7 +299,7 @@ class ServiceProxy(object):
     def __del__(self):
         global _node
         _node.destroy_client(self._client)
-    
+
     def __call__(self, req):
         global _node
         resp = self._client.call_async(req)
@@ -281,7 +309,7 @@ class ServiceProxy(object):
 class Duration(object):
     def __new__(cls, secs, nsecs = 0):
         global _node
-        d = rclpy.duration.Duration(nanoseconds = secs * 1000000000 + nsecs)
+        d = rclpy.duration.Duration(nanoseconds = secs * rclpy.duration.S_TO_NS + nsecs)
         d.to_nsec = types.MethodType(lambda self: self.nanoseconds, d)
         d.to_sec = types.MethodType(lambda self: self.nanoseconds / 1e9, d)
         d.is_zero = types.MethodType(lambda self: self.nanoseconds == 0, d)
@@ -291,11 +319,11 @@ class Duration(object):
 
     @classmethod
     def from_sec(cls, secs):
-        return rclpy.duration.Duration(nanosecods = secs * 1000000000)
+        return rclpy.duration.Duration(nanoseconds = secs * rclpy.duration.S_TO_NS)
 
     @classmethod
     def from_seconds(cls, secs):
-        return rclpy.duration.Duration(nanosecods = secs * 1000000000)
+        return rclpy.duration.Duration(nanoseconds = secs * rclpy.duration.S_TO_NS)
 
 class Time(object):
     def __new__(cls, secs = 0, nsecs = 0):
@@ -303,11 +331,14 @@ class Time(object):
 
     @classmethod
     def from_sec(cls, secs):
-        return builtin_interfaces.msg.Time(sec = secs)
+        nanoseconds = secs * rclpy.duration.S_TO_NS
+        seconds, nanoseconds = (nanoseconds // rclpy.duration.S_TO_NS, nanoseconds % rclpy.duration.S_TO_NS)
+        return builtin_interfaces.msg.Time(sec = int(seconds), nanosec = int(nanoseconds))
 
     @classmethod
     def from_seconds(cls, secs):
-        return builtin_interfaces.msg.Time(sec = secs)
+        seconds, nanoseconds = divmod(secs, rclpy.duration.S_TO_NS)
+        return builtin_interfaces.msg.Time(sec = int(seconds), nanosec = int(nanoseconds))
 
     @classmethod
     def now(cls):
@@ -333,7 +364,11 @@ class Timer(object):
     def __init__(self, timer_period, callback):
         global _node
         self.callback = callback
-        self._timer = _node.create_timer(timer_period, self._ros2_callback)
+        if type(timer_period) is rclpy.duration.Duration:
+            period_sec = timer_period.nanoseconds / 1e9
+        else:
+            period_sec = timer_period
+        self._timer = _node.create_timer(period_sec, self._ros2_callback)
 
     def __del__(self):
         global _node
@@ -402,7 +437,7 @@ exceptions = _Module()
 exceptions.ROSException = ROSException
 exceptions.ROSInitException = ROSInitException
 
-builtin_interfaces.msg.Time.to_nsec = lambda self: self.sec * 1000000000 + self.nanosec
+builtin_interfaces.msg.Time.to_nsec = lambda self: self.sec * rclpy.duration.S_TO_NS + self.nanosec
 builtin_interfaces.msg.Time.to_sec = lambda self: self.sec + self.nanosec / 1e9
 builtin_interfaces.msg.Time.is_zero = lambda self: self.sec == 0 and self.nanosec == 0
 def secs_setter(self, value): self.sec = value
